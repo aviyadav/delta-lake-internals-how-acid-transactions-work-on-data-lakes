@@ -1,0 +1,18 @@
+version: 2
+
+sources:
+  - name: lakehouse
+    description: Delta tables produced by the Spark Silver job.
+    schema: silver
+    tables:
+      - name: orders
+        description: One current row per order, conformed from Postgres and Kafka.
+        columns:
+          - name: order_id
+            tests:
+              - unique
+              - not_null
+          - name: order_status
+            tests:
+              - accepted_values:
+                  values: ["CREATED", "PAID", "COMPLETED", "CANCELLED", "REFUNDED"]

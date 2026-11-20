@@ -1,0 +1,329 @@
+name: shopazone-lakehouse
+
+x-aws: &aws
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  AWS_REGION: us-east-1
+  S3_ENDPOINT: http://localstack:4566
+
+x-lake: &lake
+  LAKEHOUSE_BUCKET: lakehouse
+  HMS_URI: thrift://hive-metastore:9083
+  SPARK_MASTER: spark://spark-master:7077
+  KAFKA_BOOTSTRAP: kafka:9092
+  KAFKA_TOPIC: shopazone.orders.events
+  ORDERS_JDBC_URL: jdbc:postgresql://postgres:5432/orders
+  ORDERS_JDBC_USER: orders
+  ORDERS_JDBC_PASSWORD: orders
+  PYTHONPATH: /opt/jobs
+  TZ: UTC
+
+x-spark-image: &spark-image
+  image: shopazone/spark:3.5.4
+  build:
+    context: .
+    dockerfile: docker/spark/Dockerfile
+
+services:
+  # ---------------------------------------------------------------- object storage
+  localstack:
+    image: localstack/localstack:3.8
+    container_name: lake-s3
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+      EAGER_SERVICE_LOADING: "1"
+      PERSISTENCE: "1"
+      SNAPSHOT_SAVE_STRATEGY: ON_SHUTDOWN_AND_SCHEDULE
+      SNAPSHOT_LOAD_STRATEGY: ON_STARTUP
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - ./docker/localstack/init:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # ---------------------------------------------------------------- operational DB + metadata DB
+  postgres:
+    image: postgres:16-alpine
+    container_name: lake-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # ---------------------------------------------------------------- catalog
+  hive-metastore:
+    image: shopazone/hive-metastore:4.0.0
+    build:
+      context: .
+      dockerfile: docker/hive/Dockerfile
+    container_name: lake-hive-metastore
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/opt/hive/metastore-entrypoint.sh"]
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      HIVE_CUSTOM_CONF_DIR: /opt/hive/conf
+      HIVE_AUX_JARS_PATH: /opt/hive/lib
+      HADOOP_CLASSPATH: /opt/hive/lib/*
+      CLASSPATH: /opt/hive/lib/hadoop-aws-3.3.6.jar:/opt/hive/lib/aws-java-sdk-bundle-1.12.367.jar
+    volumes:
+      - ./docker/hive/hive-site.xml:/opt/hive/conf/hive-site.xml:ro
+    ports:
+      - "9083:9083"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9083'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # ---------------------------------------------------------------- processing cluster
+  spark-master:
+    <<: *spark-image
+    container_name: lake-spark-master
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+      --host spark-master --port 7077 --webui-port 8080
+    environment: *aws
+    ports:
+      - "8090:8080"
+      - "7077:7077"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/json/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  spark-worker:
+    <<: *spark-image
+    container_name: lake-spark-worker
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --cores 8 --memory 8g --webui-port 8081
+    environment: *aws
+    ports:
+      - "8091:8081"
+
+  # HiveServer2/Thrift endpoint used by dbt-spark
+  spark-thrift:
+    <<: *spark-image
+    container_name: lake-spark-thrift
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      hive-metastore:
+        condition: service_healthy
+    command: >
+      /opt/spark/bin/spark-submit --master spark://spark-master:7077 --deploy-mode client
+      --name shopazone-thrift
+      --conf spark.cores.max=2
+      --conf spark.driver.memory=1g
+      --conf spark.hive.server2.thrift.port=10000
+      --class org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
+      --verbose /opt/spark/jars/spark-sql_2.12-3.5.4.jar
+    environment: *aws
+    ports:
+      - "10000:10000"
+      - "4041:4040"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/10000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # ---------------------------------------------------------------- streaming source
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: lake-kafka
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  order-event-producer:
+    build:
+      context: .
+      dockerfile: docker/producer/Dockerfile
+    container_name: lake-producer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: shopazone.orders.events
+      EVENTS_PER_SECOND: "1"
+    restart: unless-stopped
+
+  # Kafka -> Bronze Delta (Spark Structured Streaming, always-on)
+  stream-bronze:
+    <<: *spark-image
+    container_name: lake-stream-bronze
+    depends_on:
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+      hive-metastore:
+        condition: service_healthy
+    command: >
+      /opt/spark/bin/spark-submit --master spark://spark-master:7077 --deploy-mode client
+      --name shopazone-stream-bronze
+      --conf spark.executor.cores=1
+      --conf spark.cores.max=1
+      --conf spark.executor.memory=1g
+      --conf spark.driver.memory=1g
+      --conf spark.sql.streaming.checkpointLocation=s3://lakehouse/checkpoints/bronze_order_events_v2
+      /opt/jobs/stream_order_events.py
+    environment:
+      <<: [*aws, *lake]
+    volumes:
+      - ./jobs:/opt/jobs:ro
+    restart: unless-stopped
+
+  # One-off Spark driver for manual jobs (make spark-job / demos)
+  spark-client:
+    <<: *spark-image
+    profiles: ["tools"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      hive-metastore:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: "sleep infinity"
+    environment:
+      <<: [*aws, *lake]
+    volumes:
+      - ./jobs:/opt/jobs:ro
+
+  # ---------------------------------------------------------------- orchestration
+  airflow-init:
+    image: shopazone/airflow:2.10.5
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    container_name: lake-airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: &airflow-env
+      <<: [*aws, *lake]
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__DEFAULT_TIMEZONE: UTC
+      AIRFLOW__WEBSERVER__SECRET_KEY: shopazone-lakehouse-secret
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "10"
+      AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077, "extra": {"deploy-mode": "client"}}'
+      AIRFLOW_CONN_TRINO_DEFAULT: trino://airflow@trino:8080/gold
+      DBT_PROFILES_DIR: /opt/dbt/profiles
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        airflow db migrate
+        airflow users create --username admin --password admin \
+          --firstname Lakehouse --lastname Admin --role Admin --email admin@example.com || true
+    volumes: &airflow-volumes
+      - ./dags:/opt/airflow/dags:ro
+      - ./jobs:/opt/jobs:ro
+      - ./dbt:/opt/dbt:ro
+      - airflow-logs:/opt/airflow/logs
+
+  airflow-webserver:
+    image: shopazone/airflow:2.10.5
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    container_name: lake-airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    command: airflow webserver --port 8080
+    environment: *airflow-env
+    volumes: *airflow-volumes
+    ports:
+      - "8080:8080"
+      - "4040:4040"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health | grep -q healthy"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+
+  airflow-scheduler:
+    image: shopazone/airflow:2.10.5
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    container_name: lake-airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    command: airflow scheduler
+    environment: *airflow-env
+    volumes: *airflow-volumes
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- serving / query
+  trino:
+    image: trinodb/trino:476
+    container_name: lake-trino
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    ports:
+      - "8085:8080"
+    volumes:
+      - ./docker/trino/config.properties:/etc/trino/config.properties:ro
+      - ./docker/trino/node.properties:/etc/trino/node.properties:ro
+      - ./docker/trino/catalog/delta.properties:/etc/trino/catalog/delta.properties:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/v1/info >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  localstack-data:
+  pg-data:
+  airflow-logs:
